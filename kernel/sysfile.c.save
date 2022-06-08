@@ -1,0 +1,848 @@
+//
+// File-system system calls.
+// Mostly argument checking, since we don't trust
+// user code, and calls into file.c and fs.c.
+//
+
+#include <cdefs.h>
+#include <defs.h>
+#include <fcntl.h>
+#include <file.h>
+#include <fs.h>
+#include <mmu.h>
+#include <param.h>
+#include <proc.h>
+#include <sleeplock.h>
+#include <spinlock.h>
+#include <stat.h>
+
+#define NULL ((void *)0)
+
+
+//TODO, do these need to be global defined? I.E. in defs.h??
+//struct ftable {
+ // struct file_info data[NFILE];
+ // struct spinlock lock;
+//};
+
+
+//struct ftable global_file_info_array;
+
+struct file_info global_file_info_array[NFILE];
+
+struct spinlock global_ftable_lock;
+
+
+
+//mark that no files have been allocated
+//yet so it's a good idea to "zero"
+//the global array (and process table) in case random junk
+//looks like something useful
+int first_file_allocated = 0;
+
+
+//for kernel buffer of pipes
+////actual size of buffer is 4KB but to avoid edge cases
+//leave some breather room by considering it only 3900 bytes
+
+int MAX_CURSOR_VALUE = 3900;
+
+/*
+ * arg0: int [file descriptor]
+ *
+ * duplicate the file descriptor arg0, must use the smallest unused file descriptor
+ * returns a new file descriptor of the duplicated file, -1 otherwise
+ *
+ * dup is generally used by the shell to configure stdin/stdout between
+ * two programs connected by a pipe (lab 2).  For example, "ls | more"
+ * creates two programs, ls and more, where the stdout of ls is sent
+ * as the stdin of more.  The parent (shell) first creates a pipe
+ * creating two new open file descriptors, and then create the two children.
+ * Child processes inherit file descriptors, so each child process can
+ * use dup to install each end of the pipe as stdin or stdout, and then
+ * close the pipe.
+ *
+ * Error conditions:
+ * arg0 is not an open file descriptor
+ * there is no available file descriptor
+ */
+
+int sys_dup(void) {
+
+  //no files have even been opened so must be error
+  if(first_file_allocated == 0){
+    return -1;
+  }
+
+  //for getting file descriptor arg
+  int fd;
+
+  //check valid_fd
+  int valid_fd = argfd(0, &fd);
+
+  if(valid_fd < 0){
+    return -1;
+  }
+
+  acquire(&global_ftable_lock);
+
+  //find the first open value in the per
+  //process table and set it's pointer accordingly
+  for(int i = 0; i < NOFILE; i++){
+
+      if(myproc() -> proc_ptr_to_global_table[i] == NULL ){
+        myproc() -> proc_ptr_to_global_table[i] = myproc() -> proc_ptr_to_global_table[fd];
+        //increment the in mem ref count since now the process has an additional pointer to it
+        myproc() -> proc_ptr_to_global_table[i] -> in_mem_ref_count = myproc() -> proc_ptr_to_global_table[i] -> in_mem_ref_count + 1;
+
+        release(&global_ftable_lock);
+
+        //this i value is the lowest available file descriptor so return it
+        return i;
+      }
+    }
+
+  release(&global_ftable_lock);
+
+
+  //no valid value was found
+
+  return -1;
+}
+
+
+
+
+void pipe_check_if_read_needs_sleep(struct pipe* active_pipe){
+  //if the read and write cursrors equal each other then a read
+  //cannot occur because that means this pipe hasn't yet been written
+  //to since this only is possible for a fresh pipe
+  //
+  //the other edge case is make sure there is always a gap
+  //of 1 between the reader and the writer that is that the reader cursor
+  //can read a byte and move forward by at least 1 and won't overlap
+  //the writer cursor (in simpler terms write cursor must always lead read cursor by 2)
+  if( (active_pipe -> read_cursor == active_pipe -> write_cursor) || ((active_pipe -> read_cursor < active_pipe -> write_cursor) && (active_pipe -> write_cursor - active_pipe -> read_cursor <= 1)) || (active_pipe -> read_cursor == active_pipe -> data +  MAX_CURSOR_VALUE && active_pipe -> write_cursor == active_pipe -> data) ){
+
+    while((active_pipe -> read_cursor == active_pipe -> write_cursor) || ((active_pipe -> read_cursor < active_pipe -> write_cursor) && (active_pipe -> write_cursor - active_pipe -> read_cursor <= 1)) || (active_pipe -> read_cursor == active_pipe -> data +  MAX_CURSOR_VALUE && active_pipe -> write_cursor == active_pipe -> data) ){
+      //sleep until there is room to read, by using a pointer to the pipe
+      //as the chan value this means any other processes that have access
+      //to the pipe can also wakeup on the same chan so a deadlock won't happen
+      sleep(&active_pipe, &global_ftable_lock);
+    }
+  }
+}
+
+
+/*
+ * arg0: int [file descriptor]
+ * arg1: char * [buffer to write read bytes to]
+ * arg2: int [number of bytes to read]
+ *
+ * reads up to arg2 bytes from the current position of the file descriptor
+ * arg0 and places those bytes into arg1. The current position of the
+ * file descriptor is updated by that number of bytes.
+ *
+ * returns number of bytes read, or -1 if there was an error.
+ *
+ * If there are insufficient available bytes to complete the request,
+ * reads as many as possible before returning with that number of bytes.
+ *
+ * Fewer than arg2 bytes can be read in various conditions:
+ * If the current position + arg2 is beyond the end of the file.
+ * If this is a pipe or console device and fewer than arg2 bytes are available
+ * If this is a pipe and the other end of the pipe has been closed.
+ *
+ * Error conditions:
+ * arg0 is not a file descriptor open for read
+ * some address between [arg1,arg1+arg2-1] is invalid
+ * arg2 is not positive
+ */
+
+int sys_read(void) {
+
+  //no files have even been opened so must be error
+  if(first_file_allocated == 0){
+    return -1;
+  }
+
+  //for getting file descriptor arg
+  int fd;
+
+  //the buffer to read into
+  char* buf;
+
+  //get the number of bytes to read
+  int size;
+
+  acquire(&global_ftable_lock);
+
+
+  //check valid_fd
+  int valid_fd = argfd(0, &fd);
+
+  if(valid_fd < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+
+  //check that the permission of the file isn't write only
+  if(myproc() -> proc_ptr_to_global_table[fd] ->permissions == O_WRONLY){
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+  //check valid argint
+  int err_code_argint2 = argint(2, &size);
+
+  if(err_code_argint2 < 0){
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+  //negative size shouldn't be valid
+  if(size < 0){
+    release(&global_ftable_lock);
+    return -1;
+  }
+
+  //check valid ptr retrieved
+  int err_code_argptr = argptr(1, &buf, size);
+
+  if(err_code_argptr < 0){
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+
+//dealing with inode
+if(myproc() -> proc_ptr_to_global_table[fd] -> is_pipe == 0){
+
+    //get pointer to inode referenced b the file descriptor
+    struct inode* fd_inode = myproc() -> proc_ptr_to_global_table[fd] -> ref_inode;
+
+    //if for some reason the inode isn't valid
+    //this should yield error
+    if(fd_inode == NULL){
+      release(&global_ftable_lock);
+
+      return -1;
+    }
+
+    //get the current offset
+    int offset = myproc() -> proc_ptr_to_global_table[fd] -> current_offset;
+
+    release(&global_ftable_lock);
+
+
+    //read the bytes
+    int bytes_read = concurrent_readi(fd_inode, buf, offset, size);
+
+    acquire(&global_ftable_lock);
+
+
+    //if the read was successful increment the offset appropriately
+    //for the global file struct
+    if(bytes_read > 0){
+      myproc() -> proc_ptr_to_global_table[fd] -> current_offset = myproc() -> proc_ptr_to_global_table[fd] -> current_offset + bytes_read;
+    }
+
+    release(&global_ftable_lock);
+
+    return bytes_read;
+
+  //dealing with pipe
+  }else{
+
+
+    struct pipe* active_pipe = myproc() -> proc_ptr_to_global_table[fd] -> ref_pipe;
+
+    if(active_pipe -> reader_exists == 1){
+      while(active_pipe -> reader_exists == 1){
+        sleep(&active_pipe, &global_ftable_lock);
+      }
+    }
+    //make this process the active reader
+    active_pipe -> reader_exists = 1;
+
+    int bytes_read = 0;
+
+    //if there are no active writers read whatever is left in the pipe (if anything)
+    if(active_pipe -> ref_count_writers == 0) {
+      //if the cursors are equal this means the pipe was never written to or
+      //read from since a gap is enforced after the first write/read
+      //therefore return 0
+      if(active_pipe -> read_cursor == active_pipe -> write_cursor){
+        release(&global_ftable_lock);
+        return bytes_read;
+        //here it's ok if the read cursor overlaps the write cursor
+        //because the pipe will be closed after the read
+      }else{
+        for(int i = 0; i < size; i++){
+          buf[i] = *active_pipe -> read_cursor;
+          bytes_read = bytes_read + 1;
+          //if the cursor is at the end of the buffer
+          //reset it to the beginning
+          if(active_pipe -> read_cursor == active_pipe -> data + MAX_CURSOR_VALUE){
+            active_pipe -> read_cursor = active_pipe -> data;
+          }else{
+            active_pipe -> read_cursor = active_pipe -> read_cursor + 1;
+          }
+          //if the read cursor = the write cursor there is no more bytes to read
+          //or if this is the last bytes requested by the user then return
+          if(active_pipe -> read_cursor == active_pipe -> write_cursor || i == size - 1){
+            release(&global_ftable_lock);
+            return bytes_read;
+          }
+        }
+      }
+
+    }
+
+    //check if we should sleep
+    pipe_check_if_read_needs_sleep(active_pipe);
+
+
+    //begin reading from the pipe
+    for(int i = 0; i < size; i++){
+      buf[i] = *active_pipe -> read_cursor;
+      bytes_read = bytes_read + 1;
+      //if the cursor is at the end of the buffer
+      //reset it to the beginning
+      if(active_pipe -> read_cursor == active_pipe -> data + MAX_CURSOR_VALUE){
+        active_pipe -> read_cursor = active_pipe -> data;
+      //otherwise just increment
+      }else{
+        active_pipe -> read_cursor = active_pipe -> read_cursor + 1;
+      }
+      //if the read cursor = the write cursor there is no more bytes to read
+      //or if this is the last bytes requested by the user then return
+      if(i == size - 1){
+        break;
+      }else{
+        //check if needs to sleep
+        pipe_check_if_read_needs_sleep(active_pipe);
+      }
+
+    }
+    //let other processes become the readers since we are done
+    active_pipe -> reader_exists = 0;
+    release(&global_ftable_lock);
+    return bytes_read;
+
+  }
+
+
+
+}
+
+
+//checks if the writer to a pipe should sleep
+//if it does it loops until it doesn't need to sleep
+void pipe_check_if_write_needs_sleep(struct pipe* active_pipe){
+
+
+
+  if( ( (active_pipe -> write_cursor < active_pipe -> read_cursor) && ( active_pipe -> read_cursor - active_pipe -> write_cursor) <= 1) || (active_pipe -> read_cursor == active_pipe -> data && active_pipe -> write_cursor == active_pipe -> data + MAX_CURSOR_VALUE)){
+    //for my implementation to avoid lapping the read cursor
+    //the write cursor must always remain at least 1 behind
+    //the read cursor, that is assuming write_cursor < read_cursor
+    //if write_cursor - read_cursor <= 1 then no writes are allowed
+    //because the buffer is flow and needs to block
+    while( ( (active_pipe -> write_cursor < active_pipe -> read_cursor) && ( active_pipe -> read_cursor - active_pipe -> write_cursor) <= 1) || (active_pipe -> read_cursor == active_pipe -> data && active_pipe -> write_cursor == active_pipe -> data + MAX_CURSOR_VALUE)  ){
+      //sleep until there is room to write, by using a pointer to the pipe
+      //as the chan value this means any other processes that have access
+      //to the pipe can also wakeup on the same chan so a deadlock won't happen
+      sleep(&active_pipe, &global_ftable_lock);
+    }
+  }
+}
+
+
+//  return 0;
+
+
+/*
+ * arg0: int [file descriptor]
+ * arg1: char * [buffer of bytes to write to the given fd]
+ * arg2: int [number of bytes to write]
+ *
+ * writes up to arg2 bytes from arg1 to the current position of
+ * the file descriptor. The current position of the file descriptor
+ * is updated by that number of bytes.
+ *
+ * returns number of bytes written, or -1 if there was an error.
+ *
+ * If the full write cannot be completed, writes as many as possible
+ * before returning with that number of bytes. For example, if the disk
+ * runs out of space.
+ *
+ * If writing to a pipe and the other end of the pipe is closed,
+ * will return -1.
+ *
+ * Error conditions:
+ * arg0 is not a file descriptor open for write
+ * some address between [arg1,arg1+arg2-1] is invalid
+ * arg2 is not positive
+ *
+ * note that for lab1, the file system does not support writing past
+ * the end of the file. Normally this would extend the size of the file
+ * allowing the write to complete, to the maximum extent possible
+ * provided there is space on the disk.
+ */
+
+int sys_write(void) {
+
+  //no files have even been opened so must be error
+  if(first_file_allocated == 0){
+    return -1;
+  }
+  // you have to change the code in this function.
+  // Currently it supports printing one character to the screen.
+
+  //for getting file descriptor arg
+  int fd;
+
+  //the buffer to use for writing from
+  char* buf;
+
+  //get the number of bytes to write
+  int size;
+
+  acquire(&global_ftable_lock);
+
+
+  //check valid_fd
+  int valid_fd = argfd(0, &fd);
+
+  if(valid_fd < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+  //check that the permission of the file isn't read only
+  if(myproc() -> proc_ptr_to_global_table[fd] ->permissions == O_RDONLY){
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+  //check valid arg int
+  int err_code_argint2 = argint(2, &size);
+
+  if(err_code_argint2 < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+  //negative size shouldn't be valid
+  if(size < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+  //check valid pointer retrieved
+  int err_code_argptr = argptr(1, &buf, size);
+
+  if(err_code_argptr < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+
+  //writing to an inode
+  if(myproc() -> proc_ptr_to_global_table[fd] -> is_pipe == 0){
+
+    //get the inode based on fd
+    struct inode* fd_inode = myproc() -> proc_ptr_to_global_table[fd] -> ref_inode;
+
+    //if for some reason the inode isn't valid
+    //this should yield error
+    if(fd_inode == NULL){
+
+      release(&global_ftable_lock);
+
+      return -1;
+    }
+
+    //get the offset
+    int offset = myproc() -> proc_ptr_to_global_table[fd] -> current_offset;
+
+    //write the bytes
+    int bytes_written = concurrent_writei(fd_inode, buf, offset, size);
+
+    //if the read was successful increment the offset appropriately
+    //for the global file struct
+    if(bytes_written > 0){
+      myproc() -> proc_ptr_to_global_table[fd] -> current_offset = myproc() -> proc_ptr_to_global_table[fd] -> current_offset + bytes_written;
+    }
+
+
+    release(&global_ftable_lock);
+
+
+    return bytes_written;
+ //writing to a pipe
+ }else{
+    struct pipe* active_pipe = myproc() -> proc_ptr_to_global_table[fd] -> ref_pipe;
+
+
+    //if there are no active readers of this pipe return -1
+    //because that's an error
+    if(active_pipe -> ref_count_readers == 0){
+      release(&global_ftable_lock);
+      return -1;
+    }
+    //if another writer has already began it's write process
+    //make this writer sleep until that writer is finished
+    if(active_pipe -> writer_exists == 1){
+      while(active_pipe -> writer_exists == 1){
+        sleep(&active_pipe, &global_ftable_lock);
+      }
+    }
+
+
+    //make this process the active writer to the pipe
+    active_pipe -> writer_exists = 1;
+
+    pipe_check_if_write_needs_sleep(active_pipe);
+
+    int bytes_written = 0;
+
+    for(int i = 0; i < size; i++){
+      //write the character to the
+      *active_pipe -> write_cursor = buf[i];
+      bytes_written = bytes_written + 1;
+
+      //if at the end of the buffer set write cursor back to 0
+      if(active_pipe -> write_cursor == active_pipe -> data + MAX_CURSOR_VALUE){
+        active_pipe -> write_cursor = active_pipe -> data;
+
+      //otherwise just increment by 1
+       }else{
+        active_pipe ->  write_cursor = active_pipe -> write_cursor + 1;
+      }
+      //don't sleep if the write is done
+      if(i == size - 1){
+        break;
+      }else{
+        //check if needs to sleep
+        pipe_check_if_write_needs_sleep(active_pipe);
+      }
+    }
+
+    //let other processes become the writer
+    //since we are done
+    active_pipe -> writer_exists = 0;
+
+    release(&global_ftable_lock);
+
+    return bytes_written;
+
+  }
+
+}
+
+
+/*
+ * arg0: int [file descriptor]
+ *
+ * closes the passed in file descriptor
+ * returns 0 on successful close, -1 otherwise
+ *
+ * Error conditions:
+ * arg0 is not an open file descriptor
+ */
+
+int sys_close(void) {
+
+  //no files have even been opened so must be error
+  if(first_file_allocated == 0){
+    return -1;
+  }
+
+  //for getting the file descriptor
+  int fd;
+
+  acquire(&global_ftable_lock);
+
+
+  //check valid_fd
+  int valid_fd = argfd(0, &fd);
+
+  if(valid_fd < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+
+  //get the current number of in mem references to the file
+  int num_refs = myproc() -> proc_ptr_to_global_table[fd] -> in_mem_ref_count ;
+
+  //if there's more than one reference just decrement the
+  //reference count and remove from process table
+  //only by setting null pointer at fd location
+  if(num_refs > 1){
+    myproc() -> proc_ptr_to_global_table[fd] -> in_mem_ref_count = myproc() -> proc_ptr_to_global_table[fd] -> in_mem_ref_count - 1;
+    myproc() -> proc_ptr_to_global_table[fd] = NULL;
+
+    release(&global_ftable_lock);
+
+    return 0;
+  //if this is the last reference then remove in the global table
+  //and NULL out the process table at the fd location
+}else{
+    myproc() -> proc_ptr_to_global_table[fd] -> in_mem_ref_count = 0;
+    myproc() -> proc_ptr_to_global_table[fd] -> ref_inode = NULL;
+   // myproc() -> proc_ptr_to_global_table[fd] -> ref_inode -> inum = 0;
+    myproc() -> proc_ptr_to_global_table[fd] = NULL;
+
+    release(&global_ftable_lock);
+
+    return 0;
+  }
+
+  release(&global_ftable_lock);
+
+
+  //shouldn't get here
+  return -1;
+}
+
+/*
+ * arg0: int [file descriptor]
+ * arg1: struct stat *
+ *
+ * populates the struct stat pointer passed in to the function
+ *
+ * returns 0 on success, -1 otherwise
+ * Error conditions:
+ * if arg0 is not a valid file descriptor
+ * if any address within the range [arg1, arg1+sizeof(struct stat)] is invalid
+ */
+
+int sys_fstat(void) {
+
+  //no files have even been opened so must be error
+  if(first_file_allocated == 0){
+    return -1;
+  }
+
+  //for getting file descriptor arg
+  int fd;
+
+  acquire(&global_ftable_lock);
+
+
+  //check valid_fd
+  int valid_fd = argfd(0, &fd);
+
+  if(valid_fd < 0){
+
+    release(&global_ftable_lock);
+    return -1;
+  }
+
+  //since a stat struct is going to be populated that's how large the allocated array needs to be
+  int size = sizeof(struct stat);
+
+
+  //since argptr needs char* ptr use this
+  //to allocate memory which will later
+  //become a ptr of type struct stat*
+  char* char_stat_buf;
+
+  int error_code_argptr = argptr(1, &char_stat_buf, size);
+
+  if(error_code_argptr < 0){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+  //cast to the allocated char* to struct stat*
+  struct stat* stat_struct_to_fill = (struct stat*) char_stat_buf;
+
+  //get the inode corresponding to fd
+  struct inode* fd_inode = myproc() -> proc_ptr_to_global_table[fd] -> ref_inode;
+
+  //if for some reason the inode isn't valid
+  //this should yield error
+  if(fd_inode == NULL){
+
+    release(&global_ftable_lock);
+
+    return -1;
+  }
+
+  //fill the stats to the struct
+  concurrent_stati(fd_inode, stat_struct_to_fill);
+
+  release(&global_ftable_lock);
+
+
+  return 0;
+
+
+}
+
+/*
+ * arg0: char * [path to the file]
+ * arg1: int [mode for opening the file (see inc/fcntl.h)]
+ *
+ * Given a pathname for a file, sys_open() returns a file descriptor, a small,
+ * nonnegative integer for use in subsequent system calls. The file descriptor
+ * returned by a successful call will be the lowest-numbered file descriptor
+ * not currently open for the process.
+ *
+ * Each open file maintains a current position, initially zero.
+ *
+ * returns -1 on error
+ *
+ * Errors:
+ * arg0 points to an invalid or unmapped address
+ * there is an invalid address before the end of the string
+ * the file does not exist
+ * since the file system is read only, flag O_CREATE is not permitted
+ * there is no available file descriptor
+ *
+ * note that for lab1, the file system does not support file create
+ */
+
+int sys_open(void) {
+
+
+
+  //path to file
+  char *path;
+
+  //permission
+  int permission;
+
+  //check the path is retrieved correctly
+  int err_code_argstr = argstr(0, &path);
+
+  //check if couldn't fetch the string correctly due to some error
+  if(err_code_argstr < 0){
+
+
+   return -1;
+  }
+
+  //check permission retrieved correctly
+  int err_code_argint = argint(1, &permission);
+
+  if(err_code_argint < 0){
+
+    return -1;
+  }
+
+  //O_CREATE not permitted so return error
+  if(permission == O_CREATE){
+
+    return -1;
+  }
+
+  //get the inode relevant to the path
+  //and check it's not NULL
+  struct inode* path_inode = namei(path);
+
+  if(path_inode == NULL){
+
+
+    return -1;
+  }
+
+  //need to get stats to check if console (that is Device file)
+  //since a stat struct is going to be populated that's how large the allocated array needs to be
+  int size = sizeof(struct stat);
+
+
+  //since argptr needs char* ptr use this
+  //to allocate memory which will later
+  //become a ptr of type struct stat*
+  char* char_stat_buf;
+
+  int error_code_argptr = argptr(1, &char_stat_buf, size);
+
+  if(error_code_argptr < 0){
+    return -1;
+  }
+
+  //cast to the allocated char* to struct stat*
+  struct stat* stat_struct_to_fill = (struct stat*) char_stat_buf;
+
+  //fill the stats to the struct
+  concurrent_stati(path_inode, stat_struct_to_fill);
+
+  //these permisisons only allowed on device file like console
+  if(( permission == O_WRONLY || permission == O_RDWR) && stat_struct_to_fill -> type != T_DEV){
+
+
+    return -1;
+  }
+
+
+  //if this is the first open 
+  //initialize the ftable lock 
+  if(first_file_allocated == 0){
+      initlock(&global_ftable_lock, "ftable");
+  }
+
+
+  //create the file_info struct to save
+  struct file_info fi = { .in_mem_ref_count = 1, .ref_inode = path_inode, .current_offset = 0, .permissions = permission, .is_pipe = 0, .ref_pipe = NULL };
+  acquire(&global_ftable_lock);
+
+
+  //if no files have been allocated to the global table
+  //then it contains junk which isn't good because it could
+  //look like valid data, so take this as a chance to zero it
+  //out so there's no confusion
+  if(first_file_allocated == 0){
+    first_file_allocated = 1;
+    for(int i = 0; i < NFILE; i++){
+      //make all reference counts 0
+      //this will be enough to know
+      //if it's allocated or not
+      global_file_info_array[i].in_mem_ref_count = 0;
+      //from the xv6 book an inode with inum = 0
+      //is essentially free so also set this to 0
+      //since inode numbers will also need to be checked
+      global_file_info_array[i].ref_inode -> inum = 0;
+    }
+    //also NULL out the process table since it must
+    //be the first allocation to the process table
+    //as well
+    for(int i = 0; i < NOFILE; i++){
+      //set all pointers to NULL (NULL) initially that way
+      //it's easy to see what the next available
+      //file descriptor is since NULL will never naturally
+      //appear
+      myproc() -> proc_ptr_to_global_table[i] = NULL;
+    }
+
+
+    //since this is the first gloabl allocation it is also
+    //the first local (per proccess allocation) so it's safe
+    //to set the pointer to element 1 (index 0) of the global array
+    //and also return fd = 0
+    global_file_info_array[0] = fi;
+    myproc() -> proc_ptr_to_global_table[0] = &global_file_info_array[0];
+
+

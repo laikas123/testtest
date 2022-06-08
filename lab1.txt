@@ -1,0 +1,71 @@
+Logan Aikas
+CSE 451
+Lab 1 Questions
+
+
+1)a) Which line of code in main prints the cpu information?
+
+Line 22  cpuid_print(); 
+
+1)b) Which line of code prints the physical memory table?
+
+Line 23        e820_print(); 
+
+2) What's the memory address of main function for the kernel? Does GDB work with real physical addresses or virtual addresses?
+
+The address of memory main can be given using the “x /Nx main” for some N, or “info address main”, both yield: "main" is a function at address 0xffffffff801034ae.
+
+It must be virtual addresses because the addresses are out of range for the maximum range of the physical QEMU memory.
+
+
+3) Why does xk map kernel and user-application into the same address space?
+
+One reason is that this allows the kernel instructions to refer to address offsets rather than have to reach out to a new page table since they are both in the same address space. Additionally when control switches from the user to the kernel it is much less expensive to begin using the kernel stack since a new address space doesn’t need to be loaded. Otherwise using the kernel stack would require switching to a new address space when transferring control to the kernel and then switching back to the original address space when passing control back to the user.
+
+An additional reason that came up during office hours with the professor is that if a cache was virtually tagged then any kind of changing of the address space would require a cache flush.
+
+
+4) Why is the xk user malloc (user/umalloc.c:malloc) different from the xk kernel malloc (kernel/kalloc.c:kalloc)?
+
+In kalloc.c:kalloc it only allocates specific 4096 size pages at a time whereas in malloc the user defines the size of the memory they want to allocate. Also the memory being allocated is in the kernel space, and used for things like page tables, and kernel stacks and so the user is unable to touch it. 
+
+Why is the xk user printf (user/printf.c:printf) different from the xk kernel printf (kernel/console.c:cprintf)?
+
+The user printf is allowed to write to any file descriptor of the user’s choosing. Whereas the cprintf is restricted to writing to the console.
+
+
+5) What is the first line of c code executed in the kernel when there is an interrupt? 
+
+void trap(struct trap_frame *tf) {
+
+Followed by:
+
+uint64_t addr;
+
+  if (tf->trapno == TRAP_SYSCALL) {
+
+
+6) How large (in bytes) is a trap frame?
+
+print sizeof(*tf) = 176 bytes
+
+7) What kernel functions are reported by the backtrace when it reaches sys_sleep?
+
+#0  0xffffffff80105260 in sys_sleep () at kernel/sysproc.c:50
+#1  0xffffffff80105008 in syscall () at kernel/syscall.c:170
+#2  0xffffffff8010564d in trap (tf=0xffffffff80157f50) at kernel/trap.c:39
+#3  0xffffffff801058f7 in alltraps () at kernel/trapasm.S:20
+
+
+
+
+
+
+
+
+
+
+
+
+
+
